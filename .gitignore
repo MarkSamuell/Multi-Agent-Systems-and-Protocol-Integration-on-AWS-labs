@@ -31,3 +31,8 @@ venv/
 # Chat transcripts. Worth keeping locally as a record of how a lab went, but they
 # carry account ids, ARNs and the whole working narrative -- not for publishing.
 .kiro/chats/
+
+# Working context file. Accumulates AWS account ids, resource ARNs and cost
+# figures as the course progresses -- kept local only, unlike course-notes.md
+# which stays scrubbed of that detail by convention and is fine to publish.
+.kiro/context.md
