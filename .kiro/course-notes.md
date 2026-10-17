@@ -636,3 +636,374 @@ code** — treat the implementation details as what the exercise is *stated* to 
   decomposition strategies.
 - **Concatenation**, **comparison and selection**, **voting / majority rule**, **synthesizer LLM** —
   the four aggregation strategies.
+
+# Module 3 Lab: Parallel Document Analysis
+
+## Prerequisite: Python's `concurrent.futures` in five concepts
+
+The lab uses two names from the standard library's `concurrent.futures` module, and understanding
+what they actually do makes the lab code read as obvious rather than magical. Everything below is from
+the official docs (`docs.python.org/3/library/concurrent.futures.html`).
+
+**1. The module's one job: run callables asynchronously behind a uniform interface.** You hand it a
+function, it runs the function somewhere else (a thread, a process, or — new in 3.14 — a separate
+interpreter), and hands you back a *ticket* you can cash in later. All three backends implement the
+same abstract `Executor` interface, so the calling code looks identical regardless of which one you
+picked.
+
+**2. `ThreadPoolExecutor(max_workers=N)` — a pool of at most N threads.** You `submit()` callables to
+it; it queues them and runs up to N at once, reusing idle threads rather than spawning fresh ones per
+task. Use it as a context manager (`with ... as executor:`) so it shuts down cleanly — on exit it waits
+for every pending future to finish, equivalent to `shutdown(wait=True)`.
+
+Why threads, and not processes, for LLM agents: a Bedrock call is **network I/O**. The thread spends
+almost all its time blocked waiting for the API to respond, during which Python's GIL is *released* and
+other threads run. Threads give you real overlap for I/O-bound work. They would give you nothing for
+CPU-bound work, where the GIL serializes execution — that's what `ProcessPoolExecutor` is for. The docs
+make this explicit: the default `max_workers` is `min(32, cpu_count + 4)`, deliberately *more* than the
+CPU count, "assuming that ThreadPoolExecutor is often used to overlap I/O instead of CPU work." Three
+agents waiting on three Bedrock responses is the textbook case.
+
+**3. `submit(fn, *args)` returns a `Future` — a placeholder for a result that doesn't exist yet.** The
+call returns *immediately*; the work happens in the background. A `Future` has a small, important API:
+`.result()` blocks until the value is ready and returns it (or **re-raises any exception the callable
+raised** — this is how errors in worker threads reach you); `.done()` tells you whether it's finished
+without blocking; `.exception()` returns the raised exception if there was one.
+
+**4. `as_completed(futures)` — an iterator that yields futures as each one finishes, in completion
+order, not submission order.** This is the piece that makes the lab's timing honest. If you instead
+looped `for f in futures: f.result()`, you'd block on the *first* future even if the third finished
+seconds ago. `as_completed` hands you whichever one is ready, so the slowest task gates the whole phase
+but nothing else waits unnecessarily. Any future already finished before you call it is yielded first.
+
+**5. The dict-of-futures idiom — the exact pattern the lab uses, lifted straight from the docs'
+own example.** This one is easier to understand by tracing a run than by reading the code, so here is
+one, with made-up durations: security finishes in 2s, cost in 3s, scalability in 4s.
+
+**Step 1 — build the dict. All three `submit()` calls return instantly; nothing has finished yet.**
+
+``` Python
+futures = {
+    executor.submit(run_security): "security",
+    executor.submit(run_scalability): "scalability",
+    executor.submit(run_cost): "cost",
+}
+```
+
+Each `submit()` starts a task in the background and returns a `Future` — a placeholder object, not a
+value. So right after this line runs, `futures` holds **three Future objects as keys, three strings as
+values**, and all three tasks are still running:
+
+```
+futures = {
+    <Future 0x1a... pending>: "security",
+    <Future 0x1b... pending>: "scalability",
+    <Future 0x1c... pending>: "cost",
+}
+```
+
+The dict is deliberately "backwards" — you'd normally write `{"security": future}`. It's inverted
+because of what comes next: you'll be *handed* a Future and need to find out which task it was, so the
+Future has to be the thing you look up *by*.
+
+**Step 2 — `as_completed(futures)` yields each Future the moment it finishes.** Passing a dict here
+iterates its keys, i.e. the three Futures. The iterator then blocks until *any* one of them completes,
+yields it, and waits for the next. With our durations, the loop body runs three times, in this order:
+
+| Time | What `as_completed` yields | `futures[future]` | `future.result()` |
+|---|---|---|---|
+| ~2s | the security Future | `"security"` | `2.0` |
+| ~3s | the cost Future | `"cost"` | `3.0` |
+| ~4s | the scalability Future | `"scalability"` | `4.0` |
+
+Note the order: **security, cost, scalability** — completion order, which is *not* the order they were
+submitted (security, scalability, cost). That reordering is the whole reason the dict exists. If the
+loop just got "a Future that finished," it would have no idea whether that was the security run or the
+cost run. `futures[future]` answers that: it uses the Future it was just handed as a key, and gets back
+the label stored at submission time.
+
+**Step 3 — `future.result()` gives the actual value.** `run_agent_with_retry` returns elapsed seconds
+(`-> float`), so each `.result()` is a number. Because `as_completed` only yields *finished* Futures,
+`.result()` returns immediately here — no blocking.
+
+**The final output.** After the loop, `timings` is:
+
+``` Python
+{"security": 2.0, "cost": 3.0, "scalability": 4.0}
+```
+
+Insertion order reflects completion order (security, cost, scalability). The *contents* are the same as
+if you'd run the three sequentially — the dict is a plain dict of label → seconds either way. What the
+idiom bought you is that building it took ~4s (the slowest task) instead of ~9s (the sum), and you
+never had to guess which number belonged to which agent.
+
+**Why not just loop over the dict normally?** You could write:
+
+``` Python
+for future, label in futures.items():
+    timings[label] = future.result()      # blocks on EACH future in submission order
+```
+
+This produces the identical final dict — but `future.result()` blocks until *that specific* Future is
+done. The first iteration waits ~2s for security (fine), the second waits for scalability to reach ~4s
+even though cost finished at ~3s and is sitting there ready. Total wall time is still ~4s, so for a
+"wait for everything then read it all" case this is actually fine. `as_completed` matters when you
+want to *act on each result as it arrives* — print a progress line, kick off a dependent step, bail out
+early on a failure — rather than wait for the slowest one before touching any of them. The lab uses it
+mainly as the idiomatic form; the two produce the same `timings` here.
+
+> **Note:** one deadlock the docs call out is directly relevant to agent design: a callable submitted
+> to the pool must never *wait on another future from the same pool* if the pool is small enough that
+> all workers could end up waiting. With `max_workers=3` and three specialists that never call each
+> other, this can't happen here — but it's exactly the trap you'd hit if you tried to make one
+> specialist consume another's output inside the pool. That's a dependency, and dependencies belong
+> *outside* the parallel phase (which is where the synthesizer lives).
+
+## The lab: three specialists in parallel, one synthesizer after
+
+Demo file: `lab_3/Demo/document_analysis.py`. The scenario is a platform team's launch review: before
+a system goes live, someone checks its security, its scalability, and its cost. Done by hand, those are
+three sequential reviews. Here, three specialist agents do them **concurrently**, then a synthesizer
+agent makes the launch decision.
+
+```
+          System Design Document
+                   │
+      ┌────────────┼────────────┐    ← ThreadPoolExecutor(max_workers=3)
+      ▼            ▼            ▼       all three run AT ONCE
+   Security    Scalability    Cost
+   Reviewer     Reviewer    Reviewer
+  (Nova Lite)   (Claude)   (Nova Pro)
+      │            │            │
+      └────────────┼────────────┘    ← as_completed gathers all three
+                   ▼
+          Synthesizer Agent (Claude)  ← runs AFTER all three, reads their caches
+                   │
+                   ▼
+     Launch Decision: APPROVE | APPROVE-WITH-CONDITIONS | BLOCK
+```
+
+This is Module 3's pattern made concrete, and it's **aspect-based decomposition** specifically: three
+agents analyze the *same* document along three *independent* dimensions. The independence is real —
+the security reviewer never needs the scalability findings, the cost reviewer never needs the security
+findings — which is the golden rule from Module 3 satisfied, and therefore what licenses running them
+in parallel at all.
+
+**Why total time is the max, not the sum.** If the three specialists take 2s, 4s, and 3s, the parallel
+phase takes 4s (the slowest one), not 9s. Modules 1 and 2 paid the sum because each stage genuinely
+waited on the previous one. Here nothing waits, so you pay only for the longest.
+
+### The two documents
+
+- **DOC-001, E-Commerce Platform v2.0** — a big customer-facing system: React frontend, Node.js API
+  with JWT auth, PostgreSQL with read replicas, Redis for sessions, Stripe payments (PCI DSS scope), a
+  SageMaker recommendation endpoint. Expected load 50,000 concurrent users, 500 req/sec peak.
+- **DOC-002, Internal HR Portal** — much simpler: Angular + Flask on Fargate, single MySQL instance,
+  Cognito SSO against corporate AD, VPN-only access. 500 concurrent users, 20 req/sec.
+
+Two deliberately different risk profiles, so you can watch the system reach two different decisions.
+
+### Findings are hardcoded, and the model is told not to re-analyze
+
+As in Modules 1 and 2, the "analysis" is a lookup, not model reasoning. `SECURITY_FINDINGS`,
+`SCALABILITY_FINDINGS`, and `COST_FINDINGS` are Python dicts keyed by document ID, each holding a
+pre-written `risk_level`, a `findings` list, and a `recommendation`. The tool looks up the document ID
+and returns what's there. DOC-001's security entry, for instance, flags JWT tokens in `localStorage`
+(XSS-vulnerable), a missing WAF on CloudFront, and unencrypted Redis — `critical_count: 2`,
+`risk_level: HIGH`. DOC-002's is `critical_count: 0`, `risk_level: LOW`.
+
+The synthesizer's system prompt makes the division of labor explicit: *"Do NOT re-analyze the
+document. Base your assessment ONLY on the specialist findings."* The expensive model isn't being asked
+to redo the specialists' work — only to reason across their outputs.
+
+### Three caches, not one — and why that matters for threads
+
+``` Python
+# Shared caches — each specialist writes its findings here
+security_cache = {}
+scalability_cache = {}
+cost_cache = {}
+```
+
+Modules 1 and 2 used a single shared dict. This lab uses **three separate dicts, one per specialist**,
+each keyed by `document_id`. The change isn't cosmetic. Three threads are now writing concurrently, and
+by giving each thread its own dict, no two threads ever write to the same object. Whatever one might
+worry about regarding concurrent dict mutation in Python simply doesn't arise — there's nothing shared
+to contend over. The synthesizer then reads all three.
+
+> **Note:** this resolves the caveat left open in the Module 3 concept notes. The exercise does *not*
+> rely on concurrent writes to one dict being safe; it structures the data so the question never comes
+> up. That's the right instinct to carry forward: when threads need to report results, give each its
+> own slot.
+
+### The specialists: same builder shape, three models
+
+Each specialist is the exact builder shape from Modules 1–2 — `BedrockModel` + system prompt + one
+`@tool` — with the model matched to the task per Module 2's rule:
+
+| Specialist | Model | Temp | Tool | Writes to |
+|---|---|---|---|---|
+| Security Reviewer | Nova Lite | 0.0 | `review_security` | `security_cache` |
+| Scalability Reviewer | Claude | 0.1 | `review_scalability` | `scalability_cache` |
+| Cost Reviewer | Nova Pro | 0.1 | `review_cost` | `cost_cache` |
+| **Synthesizer** | **Claude** | **0.2** | `synthesize_reviews` | reads all three |
+
+Every specialist system prompt demands a strict 3-line report and ends with "Do NOT add any other
+commentary." The synthesizer demands exactly 5 lines. Same discipline as before: constrain the output
+format so there's nothing to parse loosely.
+
+``` Python
+def build_security_agent() -> Agent:
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
+    # system_prompt: report Risk Level, Critical Issues, Recommendation in exactly 3 lines
+
+    @tool
+    def review_security(document_id: str) -> str:
+        findings = SECURITY_FINDINGS.get(document_id, {})
+        result = {"document_id": document_id, "domain": "security",
+                  "risk_level": findings.get("risk_level"), ...}
+        security_cache[document_id] = result       # this thread's own cache
+        return json.dumps(result, indent=2)
+
+    return Agent(model=model, system_prompt=system_prompt, tools=[review_security])
+```
+
+### The synthesizer's decision rule
+
+The synthesizer's tool reads the three caches, takes **overall risk as the highest of the three**, and
+applies a fixed decision ladder — the one place in the file that encodes policy:
+
+``` Python
+if critical_issues >= 2 or max_risk == HIGH:    decision = "BLOCK"
+elif critical_issues >= 1 or max_risk == MEDIUM: decision = "APPROVE-WITH-CONDITIONS"
+else:                                            decision = "APPROVE"
+```
+
+So DOC-001 (security HIGH, 2 criticals) → **BLOCK**. DOC-002 (all LOW, 0 criticals) → **APPROVE**.
+
+### The parallel engine
+
+``` Python
+def run_specialists_parallel(doc_id: str) -> dict:
+    timings = {}
+
+    def run_security():
+        return run_agent_with_retry(build_security_agent, f"Review security for document {doc_id}")
+    # run_scalability and run_cost: identical one-liners
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(run_security): "security",
+            executor.submit(run_scalability): "scalability",
+            executor.submit(run_cost): "cost",
+        }
+        for future in as_completed(futures):
+            timings[futures[future]] = future.result()
+    return timings
+```
+
+Every piece is the `concurrent.futures` idiom from the primer above. `run_agent_with_retry` here
+returns the **elapsed seconds** (not the agent's text, as in Module 1 — the signature changed to
+`-> float`), which is what populates `timings`. After this function returns, all three caches are
+populated, and only then does the orchestrator run `build_synthesizer_agent()` once. **Analysis is
+parallel; synthesis is sequential** — the lesson's one-line summary, and exactly the hybrid shape the
+Module 3 notes predicted.
+
+### Demo output
+
+| Document | Security | Scalability | Cost | Decision |
+|---|---|---|---|---|
+| DOC-001 | HIGH, 2 critical | MEDIUM, bottleneck at SageMaker 200 req/sec | MEDIUM, ~$12,500/mo | **BLOCK** |
+| DOC-002 | LOW, 0 critical | LOW | LOW, ~$450/mo | **APPROVE** |
+
+During the parallel phase the terminal output is interleaved and messy — three agents printing
+`<thinking>` tags simultaneously. That mess is **evidence of concurrency**, not a bug: three threads
+are genuinely writing to stdout at the same time. The clean summary box afterward is what to read.
+
+### On the speedup number — and why it's smaller than it "should" be
+
+Four different figures appear across the lesson materials: the file header says ~3×, the spoken
+walkthrough says "roughly three times" and then "almost twice," and the written summary says 2–3×. None
+is a constant — the demo *measures* it as `t_seq_total / t_parallel_total` each run. Two things explain
+why the measured number lands nearer 2× than 3×:
+
+1. **The synthesizer is counted in both totals.** It runs once after the parallel phase and once after
+   the sequential phase, as a fixed cost added to both sides of the ratio. A fixed addend on both sides
+   pulls any ratio toward 1. The *specialist phase alone* would show the ~3× the header promises; the
+   full pipeline can't, by arithmetic.
+2. **The narration's own worked example doesn't give 3×.** With specialists at 2s, 4s, 3s, parallel
+   is 4s and sequential is 9s — that's **2.25×**, not 3×. You only approach 3× when all three
+   specialists take about the same time; with uneven durations the slowest one sets the floor.
+
+> **Note:** the honest statement is "roughly 2×, measured, with the synthesizer's fixed cost included."
+> Don't quote the header's ~3× as a result of this demo — it's an upper bound on the specialist phase
+> under equal durations, not what the code prints.
+
+### Two things in the file to know about before copying it
+
+**The decision logic is duplicated.** The BLOCK / APPROVE-WITH-CONDITIONS / APPROVE ladder appears
+once inside the synthesizer's `synthesize_reviews` tool and a second time, nearly verbatim, inside
+`main()`. The "Decision:" line printed in the summary box comes from **`main()`'s copy**, computed in
+plain Python from the caches — *not* from the synthesizer agent's output. So the synthesizer's own
+5-line report is produced but never displayed in the summary. This works, but it means two copies of
+the policy that can drift apart, and it undercuts the demo's own framing that the synthesizer "makes
+the final launch decision." If you build on this, keep one copy and read the decision from it.
+
+**Every agent runs twice.** To produce the parallel-vs-sequential comparison, `main()` clears the
+caches and re-runs all three specialists sequentially, then runs the synthesizer a second time too.
+That's seven agent invocations per document where three-plus-one would do — four of them exist purely
+to generate the timing table. Fine for a demo; a cost you would not want in anything real.
+
+## Three things to carry forward
+
+1. **Threads are right for LLM calls because they're I/O.** `ThreadPoolExecutor` overlaps network
+   waits; it would do nothing for CPU work. Match the primitive to the bottleneck.
+2. **Give each concurrent writer its own slot.** Three caches, not one — don't rely on concurrent dict
+   mutation being safe when you can structure the problem so it never happens.
+3. **Analysis is parallel, synthesis is sequential — and the sequential part caps your speedup.** A
+   fixed synthesis cost added to both sides of the comparison pulls the ratio toward 1. Measure the
+   phase you parallelized, not the whole pipeline, if you want to know what parallelism bought you.
+
+## Module 3 wrap-up: the specialist + synthesizer architecture
+
+The module closes by naming the pattern you built as a reusable architecture rather than a one-off.
+Three skills it claims you now have, restated as the design moves they correspond to:
+
+1. **Construct specialized agents and run them simultaneously** — aspect-based decomposition, with
+   each specialist scoped to exactly one domain, executed concurrently via `ThreadPoolExecutor`.
+2. **Assign independent tasks to appropriately sized models** — Module 2's model-task matching,
+   applied per specialist. The module's own list of candidate domains is worth noting because it's
+   wider than the lab's: *security checks, financial risk assessments, intellectual property reviews*.
+   The lab did security / scalability / cost; the pattern extends to any set of independent review
+   dimensions, and "intellectual property" is a reminder that the dimensions needn't be technical.
+3. **Build a synthesizer that waits for the parallel phase to finish before aggregating** — the
+   dependent sequential step that follows the independent parallel step. Its two defining properties:
+   it *waits* (it cannot start until every specialist is done, since it reads all their outputs) and
+   it *reasons across* rather than re-analyzes (its input is the specialists' findings, not the
+   original document).
+
+The reusable shape, stated once:
+
+```
+  N independent specialists  ──parallel──►  1 dependent synthesizer
+  (one domain each)                          (reads all N, decides)
+```
+
+Whenever a task decomposes into independent review angles plus a final judgment that needs all of
+them, this is the architecture. The capstone's Policy agent — "parallel multi-agent RAG across three
+Bedrock Knowledge Bases" — is this exact shape with retrievers as the specialists.
+
+## Key terms
+
+- **Parallelization** — dividing a larger task into smaller, *independent* sub-tasks that run
+  concurrently to reduce overall execution time. The independence is load-bearing; it's what makes
+  concurrent execution safe.
+- **Specialist Agent** — an LLM-powered agent scoped and configured to evaluate exactly one domain or
+  function. The "single-responsibility agent" of Module 1, now named for its role in a parallel
+  fan-out.
+- **Synthesizer Agent** — a final-stage agent that aggregates, reasons across, and summarizes the
+  outputs of multiple upstream specialists. It is the dependent step: it cannot begin until the
+  specialists finish, and it works from their findings, not from the original input.
+- **ThreadPoolExecutor** — Python's execution engine (in `concurrent.futures`) that manages a pool of
+  worker threads, enabling concurrent execution of submitted tasks. The right primitive for I/O-bound
+  work like LLM API calls, because threads overlap network waits.
