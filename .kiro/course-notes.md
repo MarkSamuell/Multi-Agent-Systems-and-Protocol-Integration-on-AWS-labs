@@ -492,3 +492,147 @@ Working it through with the file's own numbers: Nova Lite costs \$0.000036/call,
 - **Model-task matching** — the practice of pairing task difficulty/type (classification vs. reasoning
   vs. drafting) to model capability/cost tier, rather than defaulting to the most capable model for
   every step.
+
+# Module 3: Parallelization
+
+## Why run agents side by side
+
+Modules 1 and 2 ran agents strictly one after another — each stage waited for the previous one to
+finish because each stage *needed* the previous one's output. Parallelization is for the case where
+that dependency isn't there: multiple agents work on different parts of a task, or even the same task,
+**at the same time**.
+
+The obvious benefit is speed, and the module is explicit that speed is **not the main point**. Running
+several agents concurrently also produces **diverse perspectives or solutions** on the same problem,
+which can yield a richer or more dependable result than any single agent would. Parallelism is a
+quality tool as much as a latency tool — a point that becomes concrete in the "identical tasks for
+voting" decomposition strategy and the "synthesizer LLM" aggregation strategy below.
+
+## The pattern: scatter-gather
+
+The shape is borrowed directly from distributed computing's **scatter-gather** pattern: a problem is
+*scattered* to multiple workers, each works independently, and their findings are *gathered* back into
+one result. Three pieces, always:
+
+1. **A way to split the main task** into subtasks.
+2. **Individual agents that each perform a subtask** — concurrently.
+3. **A method to aggregate their outputs** into a single coherent result.
+
+```
+            Main Task
+                │
+        ┌───────┼───────┐        split (decomposition)
+        ▼       ▼       ▼
+     Agent A  Agent B  Agent C   run CONCURRENTLY — none waits for another
+        │       │       │
+        └───────┼───────┘        gather (aggregation)
+                ▼
+          Final Result
+```
+
+Contrast with Modules 1–2, where the arrows ran *down a chain* and each agent blocked on the one
+above it. Here they fan out and fan back in.
+
+## The golden rule: subtasks must be independent
+
+This is the prerequisite everything else rests on. **Agent A working on subtask A must not need to
+wait for Agent B to finish subtask B.** If one subtask's output is a direct input to another, those two
+are *not* parallelizable — that dependent portion wants a sequential pattern (the module names
+**prompt chaining**, which is what Modules 1 and 2 were actually doing) instead.
+
+The practical consequence: deciding whether to parallelize is not a performance decision you make
+after the fact. It is a *dependency analysis* you do first. Draw the data flow; wherever an arrow goes
+from one subtask's output into another's input, you have a sequential edge. Only the subtasks with no
+such edges between them can run side by side. A real system usually ends up **hybrid** — parallel
+fan-out for the independent parts, sequential chaining for the dependent ones.
+
+## Decomposition: three ways to split a task
+
+How you split determines what you can run in parallel. Three strategies, each fitting a different
+shape of problem:
+
+| Strategy | When to use it | Example | What's actually parallel |
+|---|---|---|---|
+| **Sectioning / sharding** | A large, *divisible* input | Each chapter of a book summarized by a different agent at once | Chunks of one input, same operation on each |
+| **Aspect-based decomposition** | One subject needing analysis along several *independent* dimensions | Product review: one agent on technical specs, one on user sentiment, one on competitor pricing | Different *questions* about the same single input |
+| **Identical tasks for diversity / voting** | You want a range of answers, or a more reliable single answer | Run the same classification N times (varied prompts or models), then vote | The *same* operation repeated — parallelism for robustness, not throughput |
+
+The third row is the one that makes "not just about speed" literal: you are spending more compute, not
+less, on purpose, to buy reliability or creative range.
+
+> **Note:** the module's hands-on exercise (see below) uses **aspect-based decomposition**
+> specifically — several agents each analyzing a distinct facet of one subject, then synthesized.
+
+## Aggregation: four ways to gather the results
+
+Once the parallel work finishes, something has to combine it. Four strategies, roughly in order of
+sophistication:
+
+| Strategy | How it works | Fits which decomposition |
+|---|---|---|
+| **Concatenation** | Just join the outputs end to end — append chapter summaries into one document | Sectioning / sharding |
+| **Comparison and selection** | Evaluate multiple candidate solutions against predefined criteria, keep the best one | Identical tasks (diversity) |
+| **Voting / majority rule** | When agents independently answer the same question, take the most frequent answer as final — a consensus mechanism that boosts accuracy | Identical tasks (voting) |
+| **Synthesizer / aggregator LLM** | A dedicated LLM takes the diverse outputs and weaves them into one coherent, more nuanced response | Aspect-based decomposition |
+
+The pairing in the right-hand column isn't a strict rule, but it's the natural fit: how you split
+largely decides how you have to rejoin. Sharded chunks concatenate; multiple votes get counted;
+independent *aspects* of one subject need something that can actually reason about how they relate —
+which is why the synthesizer is itself an LLM, not plain Python.
+
+> **Note:** the synthesizer is the one aggregation strategy that reintroduces an LLM into the
+> coordination layer. Modules 1 and 2 kept the coordinator as plain Python precisely to avoid parsing
+> prose. The synthesizer is a deliberate exception: when the parallel outputs are themselves prose
+> analyses of different facets, no dict lookup can combine them — only another model can. The
+> trade-off is that you've put a model back in the critical path, with everything that implies about
+> cost, latency, and non-determinism.
+
+## The hands-on exercise, as described
+
+The module closes by naming the skills its exercise builds. No `lab_3/` demo file exists in this repo
+yet, so the following is recorded from the module's own description, **not verified against source
+code** — treat the implementation details as what the exercise is *stated* to involve:
+
+- **Aspect-based decomposition** of a complex analytical task into independent subtasks.
+- **Python's `threading` module** — creating, starting, and joining threads to run agents
+  concurrently.
+- **A shared dictionary** as the strategy for collecting results from multiple threads — the same
+  "tool writes, coordinator reads" device as `_tool_results` (Module 1) and `classification_cache`
+  (Module 2), now with the added wrinkle that several threads write into it at once.
+- **Specialized system prompts** defining each agent's distinct analytical role.
+- **A synthesizer agent** whose sole job is to take the varied inputs from the parallel agents and
+  produce one coherent, higher-level output — the "synthesizer LLM" aggregation strategy, made into a
+  concrete agent.
+
+> **Note:** the shared-dictionary-across-threads detail is worth revisiting once the exercise code
+> exists. A plain `dict` written from multiple threads works in CPython in practice because the GIL
+> serializes individual dict operations, but that is an implementation detail rather than a guarantee,
+> and distinct keys per thread (one key per aspect) sidestep the question entirely. Check which the
+> exercise actually relies on before generalizing the pattern.
+
+## Four things to carry forward
+
+1. **Independence first, parallelism second.** Do the dependency analysis before deciding anything
+   runs concurrently. Dependent subtasks chain; independent ones fan out.
+2. **Parallelism buys quality, not only speed.** Running the same task N ways and voting, or
+   analyzing N aspects and synthesizing, spends *more* compute to get a *better* answer.
+3. **How you split decides how you rejoin.** Shards concatenate, votes get counted, independent
+   aspects need a synthesizer.
+4. **The synthesizer puts a model back in the coordination layer.** That's a deliberate exception to
+   Modules 1–2's plain-Python coordinator, made because prose analyses can't be combined by a dict
+   lookup — and it carries the cost, latency, and non-determinism that implies.
+
+## Key terms
+
+- **Parallelization pattern** — multiple agents working on different parts of a task, or the same
+  task, concurrently, with results consolidated afterward.
+- **Scatter-gather** — the distributed-computing pattern this borrows from: scatter a problem to
+  workers, gather their results.
+- **Subtask independence** — the prerequisite for parallelization: no subtask's output is another's
+  input.
+- **Prompt chaining** — the sequential alternative for dependent subtasks; what Modules 1 and 2
+  implemented.
+- **Sectioning / sharding**, **aspect-based decomposition**, **identical tasks** — the three
+  decomposition strategies.
+- **Concatenation**, **comparison and selection**, **voting / majority rule**, **synthesizer LLM** —
+  the four aggregation strategies.
