@@ -1007,3 +1007,327 @@ Bedrock Knowledge Bases" — is this exact shape with retrievers as the speciali
 - **ThreadPoolExecutor** — Python's execution engine (in `concurrent.futures`) that manages a pool of
   worker threads, enabling concurrent execution of submitted tasks. The right primitive for I/O-bound
   work like LLM API calls, because threads overlap network waits.
+
+# Module 4: Agent Orchestration
+
+## Three patterns in one workflow
+
+Module 1 used one pattern (sequential). Module 3 used one pattern (parallel). This module's claim is
+that real workflows need **all three at once**, chosen per phase by the shape of the dependencies:
+
+| Pattern | Use it when | The tell |
+|---|---|---|
+| **Sequential** | steps depend on each other | B needs A's output |
+| **Parallel** | steps are independent | none needs another's output |
+| **Conditional** | the path depends on the data | an `if` on a field decides which agent runs |
+
+The scenario is employee onboarding: create an account, assign a manager, provision a laptop, set up
+email, grant building access, then department-specific setup. Some steps depend on each other (you
+can't assign a manager to an account that doesn't exist), some are independent (laptop and email
+don't care about each other), and some depend on who the person is (engineers get GitHub and
+PagerDuty, salespeople get Salesforce and Gong). One workflow, three phases, three patterns.
+
+```
+            New Employee
+                 │
+   ┌─────────────▼─────────────┐
+   │ PHASE 1 — SEQUENTIAL      │  AccountCreator → ManagerAssigner
+   │ (manager needs account)   │  B waits for A
+   └─────────────┬─────────────┘
+                 │
+   ┌─────────────▼─────────────┐
+   │ PHASE 2 — PARALLEL        │  Laptop ‖ Email ‖ Building
+   │ (ThreadPoolExecutor)      │  all three at once; phase time = slowest
+   └─────────────┬─────────────┘
+                 │
+   ┌─────────────▼─────────────┐
+   │ PHASE 3 — CONDITIONAL     │  if Engineering → EngineeringOnboarding
+   │ (plain if/elif on data)   │  if Sales       → SalesOnboarding
+   └─────────────┬─────────────┘
+                 │
+          Onboarding Complete
+```
+
+## The orchestrator is Python, not an LLM — and why that is the whole point
+
+The orchestrator `orchestrate_onboarding` is a plain Python function. It runs Phase 1 as two
+sequential calls, fans Phase 2 out to a `ThreadPoolExecutor`, and picks Phase 3's agent with an
+`if/elif` on `emp["department"]`. No model makes any of those decisions.
+
+The module is emphatic about this, and the reason is **determinism**: same input always produces the
+same execution order. That buys three things an LLM orchestrator cannot give you: you can *debug* it
+(trace exactly which step failed), *test* it (unit-test each phase), and *trust* it (no risk of a model
+forgetting a step or reordering phases). This is Module 1's "the coordinator is not an agent" rule,
+now extended to cover parallel fan-out and conditional branching as well — the orchestrator's job grew,
+and it still did not need a model to do it.
+
+The division of labor is sharp: **workers are LLM agents, the orchestrator is code.** The intelligence
+lives in the six workers; the control flow lives in Python. Neither does the other's job.
+
+## Worked example: HR onboarding
+
+Demo file: `lab_4/Demo/hr_onboarding.py`. Three employees, each chosen to exercise one part of the
+workflow:
+
+| Employee | Department | Purpose |
+|---|---|---|
+| EMP-001 Alice Chen | Engineering | the engineering path through Phase 3 |
+| EMP-002 Bob Martinez | Sales | the sales path — same workflow, different Phase 3 outcome |
+| EMP-003 Carol Johnson | Engineering (DevOps) | carries `simulate_failure: True` — meant to demonstrate retry |
+
+### All six workers share one shape, and all use Nova Lite
+
+Every worker is the Module 1–2 builder: a `BedrockModel` at `temperature=0.0`, a one-line system
+prompt, one `@tool`. **All six use Nova Lite**, per Module 2's rule — these are straightforward lookup
+tasks, none needs a stronger model. The tools write into a shared `workflow_state` dict, each under its
+own key (`account`, `manager`, `laptop`, `email`, `building`, `department_onboarding`).
+
+``` Python
+def build_account_creator() -> Agent:
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
+    system_prompt = """You are an account creation agent. Your ONLY job:
+1. Call create_account with the employee_id
+2. Report: Account created for <name> (ID: <employee_id>)
+Do NOT add any other commentary."""
+
+    @tool
+    def create_account(employee_id: str) -> str:
+        # ... look up employee, build account record ...
+        workflow_state["account"] = result        # this worker's own key
+        return json.dumps(result, indent=2)
+
+    return Agent(model=model, system_prompt=system_prompt, tools=[create_account])
+```
+
+> **Note:** the file's header comment says "Claude 3 Sonnet for orchestrator" and it imports a
+> `CLAUDE_MODEL` constant — but **`CLAUDE_MODEL` is never used anywhere in the file**. There is no
+> orchestrator model, because the orchestrator is plain Python, exactly as the lesson says. The
+> header comment contradicts the code; the code is right.
+
+### One shared dict across threads — the opposite of Module 3's choice, and why it still works
+
+Module 3's lab used three separate caches, one per parallel worker. This demo uses a **single**
+`workflow_state` dict that three Phase 2 threads write to concurrently. That looks like the thing
+Module 3 avoided — but it's safe for the same underlying reason: **each tool writes a distinct key.**
+`laptop`, `email`, and `building` never collide. Two threads writing *different* keys of one dict is
+as safe as two threads writing different dicts; what you must never do is have two threads write the
+*same* key. The exercise's "Common Mistakes" section states this rule explicitly (see below). Both
+designs honor it; they just draw the boundary in different places.
+
+### The orchestrator
+
+``` Python
+def orchestrate_onboarding(employee_id: str) -> dict:
+    emp = next(e for e in EMPLOYEES if e["id"] == employee_id)
+
+    # PHASE 1 (SEQUENTIAL): account must exist before manager assignment
+    run_agent_with_retry(build_account_creator,  f"Create account for {employee_id}")
+    run_agent_with_retry(build_manager_assigner, f"Assign manager for {employee_id}")
+
+    # PHASE 2 (PARALLEL): laptop, email, building access are independent
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(run_laptop):   "laptop",
+            executor.submit(run_email):    "email",
+            executor.submit(run_building): "building",
+        }
+        for future in as_completed(futures):
+            timings[futures[future]] = future.result()
+
+    # PHASE 3 (CONDITIONAL): a code decision, not an LLM decision
+    if emp["department"] == "Engineering":
+        run_agent_with_retry(build_engineering_onboarding, f"Onboard engineer {employee_id}")
+    elif emp["department"] == "Sales":
+        run_agent_with_retry(build_sales_onboarding,       f"Onboard sales {employee_id}")
+```
+
+Phase 2 is Module 3's `ThreadPoolExecutor` + `as_completed` + dict-of-futures idiom, unchanged. Phase
+3 is an `if/elif` — the file also has an `else` that prints "Unknown department" and skips, which is
+the right thing for a value the branches don't cover.
+
+### The retry demo does not demonstrate retry — a real defect, worth understanding
+
+The narration promises that Carol's laptop provisioning "fails on the very first attempt," that you
+"see a retry message," and that it "succeeds on the second attempt" via exponential backoff. **The code
+cannot produce that.** Here is why, traced through:
+
+`run_agent_with_retry` retries only on an **exception**:
+
+``` Python
+try:
+    agent = agent_builder()
+    agent(prompt)
+    return elapsed
+except Exception as e:          # ← retry fires ONLY here
+    ... sleep(2 ** attempt) ...
+```
+
+But the simulated failure lives *inside the tool*, and it **returns** rather than raises:
+
+``` Python
+if emp.get("simulate_failure") and "laptop_attempts" not in workflow_state:
+    workflow_state["laptop_attempts"] = 1
+    return json.dumps({"error": "Provisioning system temporarily unavailable", "retry": True})
+```
+
+A returned error string is a *normal tool result*. The agent receives it, reports it in prose, and the
+call completes without exception. `run_agent_with_retry` sees success and returns. No `[Retry 1/3]`
+line prints, no backoff happens, and — critically — `workflow_state["laptop"]` is **never written** for
+Carol, because the only code path that writes it is the one the simulated failure skipped. Her summary
+box will show `Laptop: ? (?)`.
+
+What `run_agent_with_retry` *does* protect against is a real Bedrock exception — throttling, a network
+error — which the demo has no way to trigger on demand. So the mechanism is sound; the demonstration of
+it is not. The fix would be either to `raise` inside the tool (so the exception propagates up through
+the agent to the retry wrapper), or to have the orchestrator inspect `workflow_state` after the call
+and re-invoke on an error result. As written, the "failure handling" phase of this demo is a claim the
+output does not back up.
+
+> **Note:** this is worth remembering as a general rule, not just a bug report. **A tool that returns
+> an error has not failed — it has succeeded at returning an error.** The agent will happily report it.
+> If you want a failure to propagate to a retry mechanism, the tool has to raise, or something outside
+> the agent has to check the result. "Return an error dict" and "trigger a retry" are different things.
+
+### Demo output
+
+| Employee | Phase 3 route | Tools provisioned |
+|---|---|---|
+| EMP-001 Alice | Engineering | GitHub Enterprise, Jira, AWS Console, PagerDuty |
+| EMP-002 Bob | Sales | Salesforce, HubSpot, Gong, LinkedIn Sales Navigator |
+| EMP-003 Carol | Engineering | same as Alice — but laptop shows `?` per the defect above |
+
+Phase 2's reported total is the **slowest** of the three parallel workers, not the sum — Module 3's
+principle, visible again. Phases 1 and 3 are sequential and add.
+
+## The exercise: package delivery, with a gate
+
+Exercise file: `lab_4/delivery_workflow.py` (at the `lab_4/` root, not under `Demo/`). Same three-phase
+shape as the demo, same six-worker count, same single `workflow_state` dict — with one twist in each
+phase.
+
+```
+         New Delivery Request
+                 │
+   ┌─────────────▼─────────────┐
+   │ PHASE 1 — SEQUENTIAL GATE │  AddressValidator → valid?
+   │                           │     NO  → HALT (return early; nothing else runs)
+   │                           │     YES → continue
+   └─────────────┬─────────────┘
+                 │ only if valid
+   ┌─────────────▼─────────────┐
+   │ PHASE 2 — PARALLEL        │  Label ‖ Insurance ‖ Carrier
+   └─────────────┬─────────────┘
+                 │
+   ┌─────────────▼─────────────┐
+   │ PHASE 3 — CONDITIONAL     │  sender_country == country → Domestic
+   │                           │  else                      → International (+ customs)
+   └─────────────┬─────────────┘
+                 │
+          Delivery Processed
+```
+
+### Phase 1 — a gate, not a chain
+
+This is the new pattern. The demo's Phase 1 was a **chain**: A then B, both always run. The exercise's
+Phase 1 is a **gate**: run one validator, and if it fails, **stop the entire workflow**. Still
+sequential, but instead of "A then B" it's "validate or halt."
+
+``` Python
+run_agent_with_retry(build_address_validator, f"Validate address for {package_id}")
+validation = workflow_state.get("validation", {})
+if validation.get("status") != "valid":
+    return {"halted": True, "halt_reason": validation.get("reason"), ...}   # ← the gate
+```
+
+The `return` is the entire mechanism. It exits `orchestrate_delivery` before Phase 2 or Phase 3 can
+run. For PKG-003 (empty address), that means no label, no insurance, no carrier selection, no
+shipping — zero Bedrock calls beyond the one validator. The gate's value is **not spending compute on
+work the precondition has already ruled out.**
+
+The validator itself checks two things in the tool: is the address empty, or shorter than 10
+characters? Either → `status: "invalid"` with a reason, written to `workflow_state["validation"]` for
+the orchestrator to inspect.
+
+### Phase 3 — a different routing key
+
+The demo routed on `department == "Engineering"`. The exercise routes on whether two fields match:
+
+``` Python
+is_domestic = pkg["sender_country"] == pkg["country"]
+if is_domestic:   run_agent_with_retry(build_domestic_shipping, ...)
+else:             run_agent_with_retry(build_international_shipping, ...)
+```
+
+The international branch is where the only real logic difference lives — inside the tool body:
+
+``` Python
+customs_duty = round(pkg["declared_value"] * 0.05, 2)                       # 5% duty
+total = round(carrier["rate"] + insurance["premium"] + customs_duty, 2)
+# plus a customs_declaration block with hs_code "8543.70", customs_required=True
+```
+
+Domestic sums carrier + insurance only, sets `customs_required=False`, no declaration.
+
+### The three packages
+
+| Package | Route | What it tests |
+|---|---|---|
+| PKG-001 | US → US, $150 electronics | the straight-through path: gate passes, basic insurance, cheapest US carrier (USPS Priority $12.50), domestic |
+| PKG-002 | US → DE, $2,500 industrial | the international path: premium insurance tier (value > $1,000), DHL International, **customs duty = 5% × $2,500 = $125** |
+| PKG-003 | US → US, **empty address** | **the gate**: validator fails, workflow halts, Phase 2 and 3 show `0` in the summary table |
+
+The insurance tier is a threshold ladder in the tool (`> 1000` → premium at 5%, `> 500` → standard at
+3.5%, else basic at 2%), and the carrier selector is `min(carriers, key=rate)` — both plain code, both
+in the tool, neither an LLM decision.
+
+### Where the lesson text understates the file
+
+The lesson text's Phase 2 snippet for the exercise uses a **list** of futures with no labels
+(`futures = [executor.submit(...), ...]`) and just `f.result()`s each. The actual file uses the
+labeled dict-of-futures idiom and records per-worker timings, same as the demo and Module 3. The text
+simplified; the file is the better pattern.
+
+## Common mistakes the module names — all three verifiable in the files
+
+**Missing the workflow halt.** A gate needs a hard stop. Without the explicit `return` after a failed
+validation, Phase 2 and 3 run anyway and you've spent compute on a package with no address. The
+`return` statement *is* the gate; everything else is just a validator that gets ignored.
+
+**Using LLMs for deterministic logic.** It's tempting to ask a routing agent "is this domestic or
+international?" But `is_domestic = sender_country == dest_country` is faster, cheaper, and cannot be
+wrong. Every routing decision in both files is code. Reserve models for natural-language work and
+genuine reasoning; a field comparison is neither.
+
+**Global state race conditions.** When threads share a dict, each must write to **distinct,
+non-overlapping keys**. Both files honor this — `laptop`/`email`/`building` in the demo,
+`label`/`insurance`/`carrier` in the exercise. This is the same rule Module 3 solved with separate
+dicts; here it's solved with separate keys in one dict. The rule is about *what is written*, not *how
+many dicts there are*.
+
+## Four things to carry forward
+
+1. **Pick the pattern per phase by the dependency shape.** Dependent → sequential. Independent →
+   parallel. Data-dependent path → conditional. One workflow routinely needs all three.
+2. **The orchestrator stays code even as it gets more capable.** Fan-out, branching, gating, retry —
+   none of it needed a model. Determinism is what makes it debuggable, testable, and trustworthy.
+3. **A gate is a sequential precondition with an early `return`.** It's the only pattern here that can
+   *stop* the workflow, and its whole value is the compute it refuses to spend.
+4. **A tool that returns an error has not failed.** Retry mechanisms catch exceptions; a returned error
+   dict is a successful call. If you want retry, raise — or check the result outside the agent. The demo
+   gets this wrong, and the lesson doesn't notice.
+
+## Key terms
+
+- **Orchestration** — the automated configuration, coordination, and management of multiple agents
+  and system tasks. Here, done by a plain Python function.
+- **Deterministic Workflow** — a process whose sequence and routing are governed by code rules, not
+  by probabilistic model output. Same input → same execution order, always.
+- **Sequential Execution** — steps that depend on the previous step's completion. Two flavors seen
+  here: the **chain** (A then B, both always run) and the **gate** (validate or halt).
+- **Sequential Gate** — a precondition that must pass before any subsequent step executes; on failure
+  the workflow halts via early return.
+- **Parallel Execution** — independent tasks run simultaneously to cut total time; phase time is the
+  slowest task, not the sum.
+- **Conditional Routing** — a deterministic code decision that evaluates data and directs the workflow
+  down one of several paths. Explicitly *not* an LLM decision.
+- **The four building blocks**, as the exercise names them: **chains, gates, fan-out, routing.**
