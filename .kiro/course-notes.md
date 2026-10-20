@@ -1331,3 +1331,288 @@ many dicts there are*.
 - **Conditional Routing** — a deterministic code decision that evaluates data and directs the workflow
   down one of several paths. Explicitly *not* an LLM decision.
 - **The four building blocks**, as the exercise names them: **chains, gates, fan-out, routing.**
+
+# Module 5: Routing and Data Flow
+
+## When the orchestrator's plan isn't enough
+
+Modules 1–4 all shared one property: **every request went through the same set of agents**, in an
+order the orchestrator already knew. Module 4's conditional routing chose *which* Phase 3 agent ran,
+but the decision was a field comparison the orchestrator could make instantly. This module is for the
+case where the orchestrator *doesn't* know the plan up front — a request arrives, and the first job is
+figuring out which specialist should handle it at all.
+
+## Three routing patterns, in the abstract
+
+| Pattern | What it inspects | Use it for |
+|---|---|---|
+| **Content-based routing** | the message itself | sorting diverse incoming requests to the right specialist |
+| **Round-robin routing** | nothing about the message — just whose turn it is | spreading load evenly across *identical* agents, for scaling |
+| **Priority-based routing** | some urgency signal on the message | treating urgent work differently from routine work |
+
+Content-based is the one this module builds. Round-robin and priority are named but not implemented
+here — round-robin because it's a load-balancing concern rather than a correctness one, priority
+because it shows up as Tier 1 of the hybrid router below rather than as a standalone pattern.
+
+## Data flow management, in the abstract
+
+Routing decides *where* a message goes. Data flow management handles the fact that the payload may not
+be in the shape the receiving agent needs. Three operations, named once:
+
+- **Enhancement** — adding related information before forwarding.
+- **Filtering** — removing data the receiver doesn't need.
+- **Reformatting / transformation** — changing structure or types.
+
+The demo barely exercises this (the `input_text[:80]` truncation before logging is a filter, loosely),
+so these are vocabulary to hold onto rather than something the lab works through.
+
+## The hybrid router: four tiers, cheapest first
+
+Demo file: `lab_5/Demo/financial_router.py`. The scenario is a financial transaction system where
+requests arrive as free text — wire transfers, fraud reports, balance inquiries, high-value
+transactions — and each type needs a different specialist. The router is a **four-tier decision
+pipeline**; a request flows through the tiers in order and **the first match wins**.
+
+```
+          Incoming Request
+                │
+      ┌─────────▼─────────┐
+      │ TIER 1 — PRIORITY │  amount > $10,000?  → SeniorReviewAgent, done.
+      │  (one comparison) │  else fall through
+      └─────────┬─────────┘
+                │
+      ┌─────────▼─────────┐
+      │ TIER 2 — RULES    │  regex on the text: wire/transfer → Payments
+      │  (regex, free)    │                     fraud/stolen  → Fraud
+      │                   │                     balance/stmt  → Account
+      └─────────┬─────────┘  no match → fall through
+                │
+      ┌─────────▼─────────┐
+      │ TIER 3 — LLM      │  Nova Lite classifier → {intent, confidence}
+      │  (costs a call)   │  confidence ≥ 0.6 → route to that intent's agent
+      └─────────┬─────────┘  below 0.6 → fall through
+                │
+      ┌─────────▼─────────┐
+      │ TIER 4 — FALLBACK │  GeneralSupportAgent, flagged for human review.
+      │  (safety net)     │  Nothing is ever dropped.
+      └───────────────────┘
+```
+
+**The ordering is the whole design.** Priority first, then rules, then LLM, then fallback — always the
+cheapest, fastest option first. A number comparison runs in nanoseconds. A regex runs in microseconds.
+An LLM call runs in seconds and costs money. By trying them in that order, the expensive tier only ever
+sees the requests the cheap tiers couldn't handle.
+
+### The dispatcher
+
+``` Python
+ROUTING_RULES = [
+    (r"\b(wire|transfer|send money|payment)\b",            "PaymentsAgent"),
+    (r"\b(fraud\w*|stolen|unauthorized|suspicious)\b",     "FraudAgent"),
+    (r"\b(balance|statement|account info|account history)\b", "AccountAgent"),
+]
+CONFIDENCE_THRESHOLD = 0.6
+
+def hybrid_route(request: dict) -> dict:
+    text = request["text"]
+
+    # 1. Priority — business-critical override
+    if request.get("amount", 0) > 10000:
+        return {"target_agent": "SeniorReviewAgent", "method": "priority", "confidence": 1.0}
+
+    # 2. Rules — fast, free, deterministic
+    for pattern, agent_name in ROUTING_RULES:
+        if re.search(pattern, text.lower()):
+            return {"target_agent": agent_name, "method": "rule", "confidence": 1.0}
+
+    # 3. LLM classification — flexible, handles ambiguity
+    agent_name, confidence, _ = llm_classify(text)
+    if confidence >= CONFIDENCE_THRESHOLD:
+        return {"target_agent": agent_name, "method": "llm", "confidence": confidence}
+
+    # 4. Fallback — flag for human review
+    return {"target_agent": "GeneralSupportAgent", "method": "fallback", "confidence": confidence}
+```
+
+Four `return`s, one per tier. Tiers 1 and 2 report `confidence: 1.0` because they are deterministic —
+a rule either matched or it didn't. Only Tier 3 produces a real confidence number.
+
+### Why priority must come before rules — not just for cost
+
+The lesson frames the ordering as a cost optimization. It is also a **correctness requirement**, and
+the test data proves it. TXN-007 reads *"Wire $50,000 to an overseas account"* and TXN-008 reads *"I
+need to transfer $25,000"*. Both contain `wire` / `transfer` — both **would match the Payments rule**.
+They route to SeniorReview only because the priority check fires first and returns before the rules
+ever run. Swap Tiers 1 and 2 and both high-value transactions would misroute to PaymentsAgent with
+`confidence: 1.0`. The override only overrides because it is evaluated first.
+
+> **Note:** this is the general lesson about tiered routers. The tiers are not independent filters
+> that happen to be ordered by cost; a later tier can *also* match a request an earlier tier claimed.
+> The order encodes precedence, and precedence is policy.
+
+### The classifier: the model supplies its own confidence
+
+When Tier 3 runs, it calls a Nova Lite classifier whose system prompt locks the response to a single
+`classify_intent` tool call returning `{intent, confidence}`:
+
+``` Python
+@tool
+def classify_intent(intent: str, confidence: float) -> str:
+    classification_result["intent"] = intent.lower().strip()
+    classification_result["confidence"] = min(max(float(confidence), 0.0), 1.0)   # clamp to [0, 1]
+    return json.dumps(classification_result)
+```
+
+Read the arguments carefully: **the LLM passes `confidence` in as a tool argument.** The tool does
+not compute confidence from anything — it records the model's self-report and clamps it to `[0, 1]`
+in case the model produces something out of range. This is the first place in the course where a
+model's own judgment, rather than a dictionary lookup, feeds a routing decision. The 0.6 threshold is
+the guard against trusting that self-report blindly: below it, the request goes to a human instead.
+
+Forcing the output through a tool call (rather than free text) is the same "read structured fields,
+never parse prose" discipline from Module 1, applied to classification.
+
+### The test set, and which tier each request hits
+
+| Requests | Text pattern | Amount | Tier | Agent |
+|---|---|---|---|---|
+| TXN-001, 002 | "wire…", "transfer…" | $5,000 / $2,000 | rule | PaymentsAgent |
+| TXN-003, 004 | "stolen… unauthorized", "fraudulent" | — | rule | FraudAgent |
+| TXN-005, 006 | "balance", "statement" | — | rule | AccountAgent |
+| TXN-007, 008 | "Wire $50,000…", "transfer $25,000…" | **$50,000 / $25,000** | **priority** | SeniorReviewAgent |
+| TXN-009 | "help with my money situation, things are complicated" | — | llm | whatever the model says |
+| TXN-010 | "purple elephant moonlight dancing xkcd random words" | — | fallback | GeneralSupportAgent |
+
+Method distribution: **2 priority, 6 rule, 1 LLM, 1 fallback.** Eight of ten requests — 80% — never
+touched the LLM. That is the cost story in one number.
+
+> **Note:** the file's own header comment says rules handle "70%" and the LLM "30%"; the narration
+> says rules handle "maybe 60%"; the test set gives 60% rule + 20% priority = 80% non-LLM. These are
+> all illustrative, not measured on real traffic. The point they share is that most requests should be
+> cheap, and the exact split depends entirely on how predictable your traffic is.
+
+### "10 out of 10 correct" — read the fine print
+
+The correctness check in `main()` is:
+
+``` Python
+correct = (expected in ("LLM-classified",) or target == expected)
+```
+
+TXN-009's `expected_agent` is the literal string `"LLM-classified"`. So **TXN-009 is marked correct no
+matter what the classifier returns** — if it classified "my money situation" as fraud, or fell through
+to fallback, it still counts as a match. The accuracy claim is really nine genuinely-checked requests
+plus one that cannot fail. That's a reasonable choice for a demo whose point is the *tier* rather than
+the *answer*, but "10/10" overstates what was verified.
+
+### The workers: five specialists, all Nova Lite
+
+| Agent | Tool | What it does |
+|---|---|---|
+| PaymentsAgent | `process_payment` | marks a payment processed, issues a `PAY-` reference |
+| FraudAgent | `investigate_fraud` | opens a case; `risk_level` is `high` if amount > $1,000 else `medium` |
+| AccountAgent | `lookup_account` | returns a fixed balance and statement date |
+| SeniorReviewAgent | `senior_review` | `risk_assessment` is `elevated` if amount > $25,000 else `moderate`; sets `approval_required: True` |
+| GeneralSupportAgent | `general_support` | opens a ticket with `status: awaiting_human_review` |
+
+All five use Nova Lite, per Module 2's rule — and the file's own justification is worth quoting: *"the
+routing decision has already been made. The workers just execute."* The hard thinking happened in the
+router; the workers are lookups. A dict `AGENT_BUILDERS` maps agent names to builder functions, so
+dispatch after routing is one line: `builder = AGENT_BUILDERS[target]`.
+
+## Audit logging to DynamoDB — the first real AWS resource in the course
+
+Every routing decision is written to a DynamoDB table. This is the first module whose demo depends on
+infrastructure you have to provision; everything before ran against Bedrock alone.
+
+### The table
+
+Created by `lab_5/Demo/stack.yaml`, a CloudFormation template with one resource:
+
+``` YAML
+RoutingAuditTable:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub ${ProjectName}-routing-audit      # default: lesson-05-demo-routing-audit
+    BillingMode: PAY_PER_REQUEST                      # on-demand — no capacity to size
+    KeySchema:
+      - AttributeName: request_id   KeyType: HASH     # partition key
+      - AttributeName: timestamp    KeyType: RANGE    # sort key
+    TimeToLiveSpecification:
+      AttributeName: ttl
+      Enabled: true
+```
+
+Three design choices worth noticing:
+
+- **`PAY_PER_REQUEST`** — on-demand billing. Nothing to provision, nothing idle to pay for. Right for a
+  demo and for any audit table whose write volume is unpredictable.
+- **Composite key: `request_id` + `timestamp`.** The partition key alone wouldn't work, because the
+  same request ID could in principle be logged more than once; the sort key makes each (request, moment)
+  pair unique and lets you query one request's history in time order.
+- **TTL on an attribute named `ttl`.** DynamoDB will delete items once their `ttl` epoch-seconds value
+  is in the past. The table is self-cleaning; the code decides the retention.
+
+### The log entry
+
+``` Python
+def log_routing_decision(request_id, input_text, method, target_agent, confidence, latency_ms):
+    entry = {
+        "request_id":     request_id,
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "input_text":     input_text[:80],                     # truncated — a filter
+        "routing_method": method,
+        "target_agent":   target_agent,
+        "confidence":     str(round(confidence, 2)),
+        "latency_ms":     str(round(latency_ms, 1)),
+        "ttl":            int(time.time()) + 86400,            # auto-delete after 24h
+    }
+    audit_table.put_item(Item=entry)
+```
+
+Each entry answers the compliance questions: *which agent got this, decided by which method, how
+confident, how fast.* The 24-hour TTL is set **per item, in code** — the table's TTL setting only says
+*which attribute* to honor; the application decides the value. Change `86400` and retention changes
+with no infrastructure touch.
+
+> **Note:** `confidence` and `latency_ms` are stored as **strings**, not numbers. That sidesteps a
+> real DynamoDB annoyance — boto3 rejects Python `float` and requires `Decimal` for numeric attributes —
+> but it means you can't do numeric queries or comparisons on those fields later. A conscious trade for
+> a demo; in a real audit table you'd convert to `Decimal` and keep them numeric.
+
+### Two things the demo does that you shouldn't copy
+
+**It reads the audit log back with `scan()`.** At the end, `audit_table.scan()` pulls every item to
+print the table. Fine for ten rows. `scan` reads the *entire* table, costs read capacity proportional
+to table size, and is the wrong tool for anything beyond a demo — use `query` on a partition key, or a
+GSI, for real lookups.
+
+**It fails hard if the table is missing.** `_verify_audit_table()` runs first and does `SystemExit(1)`
+if the table can't be reached, printing the `aws cloudformation deploy` command to fix it. That is the
+*right* behavior — an audit log that silently drops writes is worse than one that refuses to start —
+but it means the demo has a hard infrastructure prerequisite, unlike every prior module.
+
+## Four things to carry forward
+
+1. **Try the cheapest routing method first, and only escalate.** Comparison → regex → LLM → fallback.
+   The expensive tier should only ever see what the cheap tiers couldn't handle.
+2. **Tier order is precedence, not just cost.** A later tier can match a request an earlier tier
+   claimed. Put overrides first because they must *win*, not only because they're fast.
+3. **A model's confidence is a self-report.** The classifier hands its own confidence to the tool as
+   an argument. Clamp it, threshold it, and send low-confidence cases to a human — don't trust it raw.
+4. **Log every automated decision somewhere you can defend it later.** Agent, method, confidence,
+   latency, timestamp — with a TTL so the table cleans itself. If a routing decision is ever
+   questioned, the audit row is the answer.
+
+## Key terms
+
+- **Hybrid routing** — combining multiple evaluation strategies (deterministic rules, priority checks,
+  LLM classification) in a fixed order to optimize speed, cost, and accuracy together.
+- **Content-based routing** — inspecting the message itself to decide its destination.
+- **Priority-based routing** — treating urgent requests differently; here, the first tier.
+- **Round-robin routing** — spreading load evenly across identical agents; named, not built.
+- **Fallback strategy** — the default path when every primary method fails or returns low confidence,
+  so no request is ever dropped.
+- **Audit logging** — recording automated decisions to a durable store for compliance and debugging.
+- **Data flow management** — transforming payloads between agents: enhancement, filtering,
+  reformatting.
