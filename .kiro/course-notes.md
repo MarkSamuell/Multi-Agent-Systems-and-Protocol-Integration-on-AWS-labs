@@ -1616,3 +1616,402 @@ but it means the demo has a hard infrastructure prerequisite, unlike every prior
 - **Audit logging** — recording automated decisions to a durable store for compliance and debugging.
 - **Data flow management** — transforming payloads between agents: enhancement, filtering,
   reformatting.
+
+# Module 6: State Management
+
+## What "state" means here, and why it's where projects stumble
+
+Every module so far shared state through a Python dict that lived for one process run and died with
+it. That was enough because no module needed to remember anything across runs, and no two agents ever
+wrote the *same* key. This module is about the two things that dict can't do: **persist** across
+interruptions and sessions, and **survive concurrent writes to the same record** without losing data.
+
+The module names this as the place multi-agent projects most often fail, and the diagnosis is simple:
+agents almost never operate in isolation. They need context gathered earlier. If the orchestrator
+doesn't manage that context deliberately, the quoting agent can't apply a discount because it doesn't
+know the customer, and the fulfillment agent can't ship because it doesn't have the address. **Agents
+without managed state are flying blind.**
+
+Two kinds of state to distinguish from the outset:
+
+| Kind | What it is | Lifetime | Example from this module |
+|---|---|---|---|
+| **Conversation-level** (within-session) | what's happening right now in this workflow | one request / one transaction | the trip record: driver, fare, ETA, version |
+| **System-level** (cross-session) | what should be remembered for next time | across sessions, across process restarts | a rider's preferred driver |
+
+The module's one-sentence architectural claim: these need **two different services**. Within-session
+transactional state goes in DynamoDB. Cross-session conversational context goes in AgentCore Memory.
+They have different consistency requirements, different lifetimes, and different access patterns, and
+forcing one store to do both jobs is how you get either a slow memory or an inconsistent transaction.
+
+## Stateful orchestration: pass only what each agent needs
+
+The order-processing worked example makes the discipline concrete. For a request like *"Quote 10 reams
+of PROD_A for ACME_CORP, needed by next Friday,"* the orchestrator holds the full state:
+
+```
+customer_id       = ACME_CORP          request_timestamp = 2025-04-30
+order_id          = ORD-12345          needed_by_date    = 2025-05-09
+order_items       = [{product_id: PROD_A, quantity: 10}]
+(later)             inventory_status, quote_details, shipping_address, payment_status …
+```
+
+But when it delegates, **it does not dump the whole state on each worker.** It passes only what that
+task needs:
+
+| Worker | Gets | Does *not* get |
+|---|---|---|
+| Inventory agent | `product_id`, maybe `quantity` | `customer_id`, `needed_by_date` — a stock check doesn't need them |
+| Quoting agent | `order_items`, `customer_id` (for discounts), maybe `inventory_status` | shipping details |
+| Fulfillment agent | `order_id`, `order_items`, `shipping_address`, `needed_by_date` | pricing internals |
+
+This is the same single-responsibility instinct from Module 1, applied to *data* instead of *tasks*.
+A worker that receives only its slice can't accidentally act on fields that aren't its business, and
+its prompt stays small. The module lists four mechanisms for the handoff — direct function arguments,
+a message object, a shared state dictionary managed by the framework (graph-based systems), or
+straight into a tool call — and every lab so far has used the third.
+
+## Handling failure: five strategies, one level up from tool errors
+
+Module 4 handled failure at the tool level (`run_agent_with_retry`). This is the next layer: what the
+*orchestrator* does when a step fails. Five strategies, roughly in order of escalation:
+
+1. **Retry logic** — for transient issues: a network blip, a rate limit. Try again, usually with
+   exponential backoff (1s, 2s, 4s). Already seen in every lab since Module 1.
+2. **Fallbacks / alternative paths** — if retries fail or the error is clearly permanent, execute
+   Plan B: route to a different agent, use a simpler backup tool, branch the workflow. Module 5's
+   fallback tier is exactly this.
+3. **Graceful failure reporting** — if the workflow truly cannot proceed, don't crash silently.
+   Terminate cleanly and report back with clear context. Module 4's gate halt is this.
+4. **Compensating actions** — the new one, and the one that matters most when a workflow mutates
+   external state. If Step 1 *charge credit card* succeeds and Step 2 *provision service* fails
+   irrecoverably, you must **undo Step 1**. Otherwise you've charged a customer for nothing. Any
+   workflow that modifies external state needs to think about atomicity and compensation up front.
+5. **Human-in-the-loop escalation** — for errors too complex, ambiguous, or critical to automate.
+   Pause, create a high-priority ticket with the inputs, intermediate results, and error logs
+   attached, and let a person decide.
+
+> **Note:** compensating actions are the strategy this module names but does not implement. The
+> ride-sharing demo never has to undo anything — if the pricing agent fails, no money has moved. Keep
+> it in mind for the capstone's Refund agent, which is exactly the kind of step that may need undoing.
+
+## The demo: three agents, one DynamoDB record
+
+Demo file: `lab_6/Demo/ride_sharing_state.py`. Infrastructure: `lab_6/Demo/stack.yaml`. The scenario
+is a ride-sharing system where a trip request needs three things done — match a driver, calculate the
+fare, estimate arrival — and **all three agents write their result into the same trip record.**
+
+```
+                  Rider requests trip
+                          │
+        ┌─────────────────▼─────────────────────┐
+        │  DynamoDB: lesson-06-shared-state-     │
+        │            trip-state                  │
+        │  trip_id (PK) │ version │ driver │     │
+        │  fare │ eta │ status │ ttl             │
+        └──────┬──────────┬──────────┬───────────┘
+               │          │          │
+        ┌──────┴───┐ ┌────┴────┐ ┌───┴─────┐
+        │ Driver   │ │ Pricing │ │  ETA    │   three agents, ONE record
+        │ Match    │ │         │ │         │   each writes its own field
+        └──────────┘ └─────────┘ └─────────┘
+               │
+        ┌──────▼──────────────────────┐
+        │ rider_memory (in-process)   │   "AgentCore Memory simulation"
+        │ preferred_driver per rider  │
+        └─────────────────────────────┘
+```
+
+### The table
+
+One resource in `stack.yaml`, simpler than Module 5's:
+
+``` YAML
+TripStateTable:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub ${ProjectName}-trip-state       # default: lesson-06-shared-state-trip-state
+    BillingMode: PAY_PER_REQUEST
+    KeySchema:
+      - AttributeName: trip_id   KeyType: HASH      # partition key ONLY — no sort key
+    TimeToLiveSpecification:
+      AttributeName: ttl
+      Enabled: true
+```
+
+Module 5's audit table had a composite key (`request_id` + `timestamp`) because the same request could
+be logged many times. This table has **only a partition key**, because there is exactly one record per
+trip and every agent updates *that one record in place*. That's the whole point — a single row that
+several writers contend over. The `version` attribute is not part of the key; it's an ordinary field
+the application uses as a lock token. TTL is set to one hour at creation (`now + 3600`), so completed
+trips clean themselves up.
+
+## The problem: lost updates
+
+What happens when two agents update the same record at the same time? The naive sequence:
+
+```
+  time →
+  Pricing agent:   READ record (driver=null, fare=null)  →  ... compute ...  →  WRITE {fare: 37.75}
+  ETA agent:          READ record (driver=null, fare=null)  →  ... compute ...  →  WRITE {eta: 29}
+```
+
+If both do a full-record `put_item`, whoever writes **last wins** and silently erases the other's
+field. The ETA agent read a record with `fare=null`, so when it writes the whole record back, `fare` is
+null again — the pricing agent's work is gone, and nothing raised an error. That is a **lost update**,
+and it is silent, which is what makes it dangerous.
+
+## The solution: optimistic locking — `update_trip` walked through
+
+"Optimistic" because it assumes conflicts are rare and doesn't lock anything up front. Instead, each
+record carries a **version number**, and every write says: *only save this if the version is still what
+I read.* If someone else wrote first and bumped the version, the write is rejected and you try again.
+
+Here is `update_trip`, the function every agent calls, annotated line by line:
+
+``` Python
+def update_trip(trip_id: str, updates: dict, max_retries: int = 3) -> dict:
+    for attempt in range(max_retries):
+
+        # ── STEP 1: READ ─────────────────────────────────────────────────────
+        # Fetch the record and capture its version. This number is the "lock
+        # token": we must hand it back unchanged when we write, as proof that
+        # nobody else has written in between.
+        response = trip_table.get_item(Key={"trip_id": trip_id})
+        current = response.get("Item")
+        if not current:
+            raise KeyError(f"Trip {trip_id} not found")
+        expected_version = int(current["version"])          # e.g. 2
+
+        # ── STEP 2: MODIFY (locally — nothing has hit DynamoDB yet) ──────────
+        # Merge in this agent's updates and bump the version by one.
+        current.update(to_dynamo(updates))                  # e.g. add fare = {...}
+        current["version"] = expected_version + 1           # 2 → 3
+        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        try:
+            # ── STEP 3: CONDITIONAL WRITE ────────────────────────────────────
+            # Put the whole record back, BUT only if the stored version still
+            # equals what we read in step 1. DynamoDB evaluates this check
+            # atomically on the server — no gap between "check" and "write".
+            trip_table.put_item(
+                Item=current,
+                ConditionExpression="version = :expected_ver",
+                ExpressionAttributeValues={":expected_ver": expected_version},
+            )
+            return from_dynamo(current)                     # success — we're done
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # ── CONFLICT ─────────────────────────────────────────────────
+                # Someone else wrote between our READ and our WRITE, so the
+                # stored version is no longer expected_version. Our local copy
+                # is stale. Wait briefly, then loop back to STEP 1 and re-read.
+                if attempt < max_retries - 1:
+                    wait = 0.1 * (2 ** attempt)             # 0.1s, 0.2s, 0.4s
+                    time.sleep(wait)
+                else:
+                    raise VersionConflictError("Version conflict after retries")
+            else:
+                raise                                       # any other error: real failure
+```
+
+**Walking a conflict through.** Suppose the record is at version 2. Pricing and ETA both read it and
+both capture `expected_version = 2`. Pricing writes first with condition `version = 2` — the stored
+version is 2, so the write succeeds and the stored version becomes 3. Now ETA writes with condition
+`version = 2` — but the stored version is 3. **DynamoDB rejects it** with
+`ConditionalCheckFailedException`. ETA sleeps 0.1s, loops to STEP 1, re-reads, sees version 3 *and*
+sees Pricing's `fare` field now present in the record, applies its own `eta` update on top of that
+fresh copy, writes with condition `version = 3`, succeeds. Both fields survive. Nothing was lost.
+
+**Three things about this that are easy to miss:**
+
+- **The check is atomic on the server.** DynamoDB compares and writes in one operation. There is no
+  window between "is the version still 2?" and "write the record" where a third party could sneak in.
+  You cannot get this guarantee by reading the version yourself and then writing — that's two round
+  trips with a gap, and the gap is where lost updates live.
+- **The retry re-reads, not re-writes.** On conflict, the loop goes back to STEP 1 and fetches a fresh
+  copy — it does *not* just resubmit the stale local record. That's what lets the losing agent pick up
+  the winner's changes before applying its own.
+- **The agents never know about each other.** Pricing doesn't check whether ETA is running. Each one
+  just reads, modifies, and conditionally writes. DynamoDB arbitrates. This is the property the lesson
+  keeps emphasizing, and it's what makes the pattern scale — adding a fourth agent requires no
+  coordination code.
+
+### Why the demo uses `put_item`, not `update_item` — and why that's deliberate
+
+The file's own header comment shows the production form:
+
+``` Python
+table.update_item(
+    Key={'trip_id': trip_id},
+    UpdateExpression='SET driver = :d, version = version + :one',
+    ConditionExpression='version = :expected',
+    ExpressionAttributeValues={':d': driver_info, ':expected': N, ':one': 1},
+)
+```
+
+`update_item` with `SET driver = :d` touches **one attribute**. Even without the version condition, it
+couldn't clobber `fare` — it never writes `fare`. The demo instead uses `put_item` of the **whole
+record**, which *would* clobber every other field if the read was stale. That is exactly the lost-update
+scenario — and it means the `ConditionExpression` is the **only** thing standing between the demo and
+data loss. The demo picks the more dangerous primitive on purpose, so the lock is visibly load-bearing
+rather than belt-and-braces. For real code, prefer `update_item` on specific attributes *and* keep the
+version condition; the two together are stronger than either alone.
+
+### `to_dynamo` / `from_dynamo` — the `Decimal` tax
+
+Two small helpers wrap every read and write:
+
+``` Python
+def to_dynamo(obj):     # Python → DynamoDB: floats become Decimal
+    return json.loads(json.dumps(obj), parse_float=Decimal)
+
+def from_dynamo(obj):   # DynamoDB → Python: Decimal becomes int or float
+    return json.loads(json.dumps(obj, default=_dynamo_default))
+```
+
+boto3 refuses Python `float` for DynamoDB numbers and demands `Decimal`. Module 5 dodged this by
+storing numbers as strings; this module does it properly, round-tripping through JSON to coerce types
+at the boundary. The `_dynamo_default` helper turns a whole-number `Decimal` back into `int` and
+anything else into `float`, so the application never sees `Decimal` objects.
+
+## The agents
+
+Three workers, the Module 1 shape, all Nova Lite at `temperature=0.0`. Each tool does the same three
+things: read the trip with `get_trip`, compute its slice, write it with `update_trip`.
+
+| Agent | Tool | Writes | Logic |
+|---|---|---|---|
+| DriverMatchAgent | `match_driver` | `driver` | preferred driver from memory if available, else highest-rated |
+| PricingAgent | `calculate_fare` | `fare` | `base + per_mile × miles × surge`; miles = 8.5 if "Airport" appears in pickup or destination, else 5.2 |
+| ETAAgent | `calculate_eta` | `eta`, **then `status`** | pickup 4 min (premium) or 7 (standard) + trip 25 (airport) or 15 |
+
+> **Note:** **the ETA agent writes twice.** `calculate_eta` calls `update_trip` once for the `eta`
+> fields and a *second* time for `{"status": "confirmed"}`. So a full trip is **four writes, not
+> three**, and the sequential scenario ends at **version 4**, not version 3 as the narration says
+> ("version went from 0 to 3, one increment per write" — three agents, but four increments). It also
+> means Scenario 2 has four concurrent writes contending for one record, more conflict pressure than
+> the lesson describes.
+
+## Cross-session memory — `rider_memory` walked through
+
+The DriverMatchAgent's tool is where the second kind of state lives. Here is the relevant part of
+`match_driver`:
+
+``` Python
+rider_memory = {}        # module-level, defined once at import
+
+@tool
+def match_driver(trip_id: str) -> str:
+    trip = get_trip(trip_id)
+    ride_type = trip.get("ride_type", "standard")
+    drivers = AVAILABLE_DRIVERS.get(ride_type, AVAILABLE_DRIVERS["standard"])
+    rider_id = trip.get("rider_id")
+
+    # ── READ from memory: does this rider have a saved preference? ──────────
+    preferred = rider_memory.get(rider_id, {}).get("preferred_driver")
+
+    if preferred and any(d["driver_id"] == preferred for d in drivers):
+        # Preferred driver exists AND is in the available pool for this ride type
+        best = next(d for d in drivers if d["driver_id"] == preferred)
+        match_reason = "preferred driver (from memory)"
+    else:
+        # First-time rider, or preferred driver not available → fall back to rating
+        best = max(drivers, key=lambda d: d["rating"])
+        match_reason = "highest rated available"
+
+    update_trip(trip_id, {"driver": {...best..., "match_reason": match_reason}})
+
+    # ── WRITE to memory: remember this choice for next time ─────────────────
+    if rider_id not in rider_memory:
+        rider_memory[rider_id] = {}
+    rider_memory[rider_id]["preferred_driver"] = best["driver_id"]
+    rider_memory[rider_id]["last_driver_name"] = best["name"]
+    ...
+```
+
+**Trace it across the three scenarios.** Alice (`RIDER-42`) rides in TRIP-001 and TRIP-003; Bob in
+TRIP-002.
+
+- **TRIP-001 (Alice, premium).** `rider_memory` is empty, so `preferred` is `None`. Falls to the
+  `else` branch: highest-rated premium driver is Carlos Rivera (4.95). Writes
+  `rider_memory["RIDER-42"] = {preferred_driver: "DRV-101", last_driver_name: "Carlos Rivera"}`.
+  Match reason: *highest rated available*.
+- **TRIP-002 (Bob, standard).** Bob has no memory entry. Highest-rated standard driver is Sarah Kim
+  (4.85). Writes Bob's preference. Doesn't touch Alice's.
+- **TRIP-003 (Alice, premium).** Now `rider_memory.get("RIDER-42")` returns Alice's entry and
+  `preferred = "DRV-101"`. The `any(...)` check confirms DRV-101 is in the premium pool. Takes the
+  `if` branch: Carlos Rivera again, match reason *preferred driver (from memory)*. **Same driver as
+  TRIP-001** — the cross-session recall the demo is showing off.
+
+The guard `any(d["driver_id"] == preferred for d in drivers)` matters: if Alice's preferred driver were
+a *standard* driver and she booked a *premium* trip, the preference would be ignored and the rating
+fallback would run. Memory informs the choice; it doesn't override availability.
+
+### What this memory actually is — and what it isn't
+
+**`rider_memory` is a Python dict.** The file says so directly: *"AgentCore Memory simulation
+(in-memory; production uses bedrock-agentcore-control)."* The demo description's claim that the system
+"uses AgentCore Memory to persist user preferences" is **not true of this code**; the lesson text's
+"stand-in" framing is the accurate one. Alice's preference is remembered in Scenario 3 **only because
+all three scenarios run in one process** and the dict is still alive. Stop the script and start it
+again, and `rider_memory` is `{}` — Alice is a stranger. The demo demonstrates the *access pattern* of
+cross-session memory (read preference → act → write preference back) without any of the persistence.
+
+What it is standing in for: AgentCore Memory's `SESSION_SUMMARY` strategy, which would hold this same
+preference in a managed store that survives process restarts, scales across instances, and is
+retrieved by rider identity. The read/write shape of the tool would be identical; the only change is
+that `rider_memory.get(...)` and `rider_memory[rider_id] = ...` become service calls.
+
+> **Note:** this is the same move Module 3 and 4 made with hardcoded findings — demonstrate the
+> *pattern* with the simplest thing that exhibits it, and defer the real integration. Reasonable for
+> teaching, but the gap between "a dict" and "a managed memory service" is the entire difficulty of
+> cross-session state, so don't mistake the demo for having shown it solved.
+
+## The three scenarios
+
+| Scenario | Trip | What it tests | Expected |
+|---|---|---|---|
+| 1 — Sequential | TRIP-001, Alice | agents run one at a time; version increments cleanly | version 0 → 4 (four writes), zero conflicts |
+| 2 — Concurrent | TRIP-002, Bob | all three agents in a `ThreadPoolExecutor`; writes collide | **conflicts > 0**, all resolved by retry, final record correct |
+| 3 — Memory | TRIP-003, Alice again | the DriverMatch tool recalls Alice's preference | same driver as TRIP-001, reason *"preferred driver (from memory)"* |
+
+Scenario 2 is the one that proves the locking works. The narration reports "something like conflicts =
+2," but the actual number is non-deterministic — it depends on exactly when each thread's read and
+write land relative to the others. It can be 0 if the three agents happen not to overlap (unlikely but
+possible), and higher with four writes in flight. **What's deterministic is the final state:** driver,
+fare, eta, and status all present, version equal to the number of successful writes. The conflict
+count is diagnostic; the correctness of the final record is the result.
+
+## Four things to carry forward
+
+1. **Two kinds of state, two stores.** Within-session transactional state and cross-session
+   conversational context have different lifetimes and consistency needs. DynamoDB for one, AgentCore
+   Memory for the other. Don't make one store do both.
+2. **A lost update is silent.** Two full-record writes from stale reads, and the last writer erases the
+   first with no error. The version-conditioned write is what turns that silent loss into a loud,
+   retryable `ConditionalCheckFailedException`.
+3. **On conflict, re-read — don't re-send.** The retry loop goes back to the READ step so the loser
+   picks up the winner's changes before applying its own. Resubmitting the stale local copy would just
+   be a slower lost update.
+4. **Compensating actions are the failure strategy you plan for before the first write.** If a
+   workflow mutates external state and a later step fails, something has to undo the earlier steps.
+   This module names it and doesn't build it; the capstone's Refund agent will need it.
+
+## Key terms
+
+- **Optimistic locking** — concurrency control that assumes conflicts are rare: read a version, write
+  conditionally on that version still being current, retry on mismatch. No locks held up front.
+- **Lost update** — the failure mode optimistic locking prevents: two writers read the same state and
+  the second write silently overwrites the first.
+- **Conditional expression** — a DynamoDB rule (`ConditionExpression`) that must evaluate true for a
+  write to succeed, checked atomically on the server. The mechanism that makes optimistic locking work.
+- **`ConditionalCheckFailedException`** — the error DynamoDB raises when the condition is false. In
+  this pattern it means *someone wrote first; re-read and retry*, not *something is broken*.
+- **Exponential backoff** — increasing the wait between retries (0.1s, 0.2s, 0.4s here) so contending
+  writers spread out instead of colliding again immediately.
+- **Compensating action** — an operation that undoes a previously committed step when a later step
+  fails, to avoid an inconsistent state (e.g., refund a charge for a service never provisioned).
+- **Human-in-the-loop escalation** — pausing an automated workflow and handing a decision to a person,
+  with full context attached, when the error is too complex or critical to automate.
