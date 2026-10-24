@@ -1838,6 +1838,40 @@ fresh copy, writes with condition `version = 3`, succeeds. Both fields survive. 
   keeps emphasizing, and it's what makes the pattern scale — adding a fourth agent requires no
   coordination code.
 
+### Reading the condition syntax: `"version = :expected_ver"`
+
+The two arguments look like one thing but are deliberately split in two:
+
+``` Python
+ConditionExpression="version = :expected_ver",
+ExpressionAttributeValues={":expected_ver": expected_version},
+```
+
+| Token | What it is | Where it's resolved |
+|---|---|---|
+| `version` | an **attribute name** — the `version` field stored in the DynamoDB item | read from the record, on the server |
+| `=` | the comparison operator | — |
+| `:expected_ver` | a **value placeholder**. The leading `:` marks it as "substitute a value here" | filled from `ExpressionAttributeValues` |
+| `{":expected_ver": 2}` | the actual value, keyed by the placeholder name including its colon | supplied by your code |
+
+DynamoDB assembles the comparison on the server: *is the stored `version` attribute equal to 2?*
+
+**Why not just write `f"version = {expected_version}"`?** Because the expression is a string that
+DynamoDB *parses as a mini-language*, and interpolating data into it is the same shape as SQL injection.
+It also loses type: a raw `"2"` in the string can't tell DynamoDB whether that's the number 2 or the
+string `"2"`, and DynamoDB types are strict. The placeholder keeps the expression's *structure* fixed
+and passes the *data* separately and typed — the same discipline as parameterised SQL using `?` or
+`:name` instead of concatenation.
+
+> **Note:** there is a sibling mechanism you will hit soon. **`ExpressionAttributeNames`** uses a `#`
+> prefix (e.g. `#st`) for *attribute names*, and is required when a field name collides with one of
+> DynamoDB's many reserved words — `status`, `name`, `data`, `size`, `type` are all reserved. `version`
+> is not, so the demo gets away without it. But the ETA agent writes `{"status": "confirmed"}` via
+> `put_item`, which is fine (reserved words only matter *inside expressions*) — the moment anyone writes
+> `ConditionExpression="status = :s"` it will fail with a validation error, and the fix is
+> `ConditionExpression="#st = :s"` plus `ExpressionAttributeNames={"#st": "status"}`. Two prefixes,
+> two jobs: `:` for values, `#` for names.
+
 ### Why the demo uses `put_item`, not `update_item` — and why that's deliberate
 
 The file's own header comment shows the production form:
@@ -1968,6 +2002,211 @@ that `rider_memory.get(...)` and `rider_memory[rider_id] = ...` become service c
 > *pattern* with the simplest thing that exhibits it, and defer the real integration. Reasonable for
 > teaching, but the gap between "a dict" and "a managed memory service" is the entire difficulty of
 > cross-session state, so don't mistake the demo for having shown it solved.
+
+## What the dict would become: cross-session memory with real AgentCore Memory
+
+This section is not from the course. It answers the question the demo raises and leaves open: what
+does `rider_memory` look like when it is a real AgentCore Memory resource instead of a Python dict? The
+API shapes below are taken from the previous course's verified work against a live AgentCore Memory
+resource (`WanderBotLongTerm`, tested 2026-10-10), not reconstructed from documentation.
+
+### The mental model shift
+
+The dict does one thing: you write a key, you read a key. AgentCore Memory does something structurally
+different, and the difference is the whole reason it's a service rather than a database:
+
+```
+  DICT                                  AGENTCORE MEMORY
+  ────                                  ────────────────
+  rider_memory[rid] = {...}             create_event(messages=[("...", "USER"), ...])
+        │                                       │
+        │  you write the FACT                   │  you write the CONVERSATION
+        │  you decide what to remember          │  the service decides what to remember
+        ▼                                       ▼
+  rider_memory[rid]["preferred_driver"]  ──extraction──►  "Alice prefers driver Carlos Rivera"
+                                          (async, ~1-2 min,       stored under
+                                           LLM-powered)           wanderbot/RIDER-42/preferences
+```
+
+You don't store `preferred_driver = "DRV-101"`. You store the *conversation* in which Alice was
+assigned Carlos — as short-term events — and a configured **strategy** reads those events, extracts
+"Alice prefers Carlos Rivera" as a long-term memory record, and files it under a namespace keyed by her
+`actorId`. Later you *retrieve* by asking a natural-language question against that namespace. The
+service, not your code, decided that a driver preference was worth remembering.
+
+That is a real trade. You lose the precision of a dict lookup — you can't `get("preferred_driver")`
+and know you'll get a driver ID back. You gain the ability to remember things you didn't anticipate
+needing to store, across every conversation the rider has ever had, without writing extraction code.
+
+### Step 1: create the memory resource once, with a strategy
+
+Short-term memory alone (`strategies=[]`, as in the previous course's Module 4) stores raw events and
+nothing else. Cross-session recall needs a **long-term strategy** — the thing that turns raw events into
+extracted insights. For rider preferences, the built-in `userPreferenceMemoryStrategy` is the right one;
+it is designed to extract exactly "user preferences, choices, and styles" from conversations.
+
+``` Python
+# pip install bedrock-agentcore
+# =====================================================
+# ONE-TIME SETUP — create the resource, or reuse it by name
+# =====================================================
+from bedrock_agentcore.memory import MemoryClient
+
+memory_client = MemoryClient(region_name="us-east-1")
+
+memory = memory_client.create_or_get_memory(
+    name="RideShareRiderMemory",
+    strategies=[{
+        "userPreferenceMemoryStrategy": {
+            "name": "rider_preferences",
+            # {actorId} is a template variable — the service substitutes the real
+            # rider ID at extraction time, so every rider gets their own namespace.
+            "namespaces": ["rideshare/{actorId}/preferences"],
+        }
+    }],
+    event_expiry_days=90,      # raw events; extracted records persist independently
+)
+MEMORY_ID = memory["id"]
+```
+
+`create_or_get_memory` is idempotent by name — safe to call on every startup, same as the previous
+course found. The namespace template `rideshare/{actorId}/preferences` is the replacement for the
+dict's key: where the dict used `rider_memory[rider_id]`, the service uses a path with `rider_id`
+filled in.
+
+### Step 2: the write path — record the conversation, not the fact
+
+In the demo, `match_driver` ends with `rider_memory[rider_id]["preferred_driver"] = best["driver_id"]`.
+The real version records what *happened* as a conversational event, and lets the strategy extract the
+preference:
+
+``` Python
+@tool
+def match_driver(trip_id: str) -> str:
+    trip = get_trip(trip_id)
+    rider_id = trip["rider_id"]
+    drivers = AVAILABLE_DRIVERS[trip["ride_type"]]
+
+    # ... choose `best` (see step 3 for how memory informs this) ...
+
+    update_trip(trip_id, {"driver": {...}})          # DynamoDB: transactional, unchanged
+
+    # ── WRITE to memory: the EVENT, not the extracted fact ──────────────────
+    memory_client.create_event(
+        memory_id=MEMORY_ID,
+        actor_id=rider_id,                           # scopes memory to this rider
+        session_id=trip_id,                          # one trip = one session
+        messages=[
+            (f"Match a driver for my {trip['ride_type']} trip to {trip['destination']}.", "USER"),
+            (f"Matched driver {best['name']} ({best['vehicle']}, rated {best['rating']}).", "ASSISTANT"),
+        ],
+    )
+    ...
+```
+
+Two things to notice against the dict version. **`actor_id` is the rider**, which is what makes this
+*her* memory and not the trip's — the previous course found that getting `actorId` wrong leaks one
+user's context into another's. And **`session_id` is the trip**, so each ride is one conversation
+thread. Short-term memory is scoped by the pair; the long-term preference is scoped by actor alone,
+which is exactly what lets TRIP-003 see what happened in TRIP-001.
+
+### Step 3: the read path — ask, don't look up
+
+The demo reads with `rider_memory.get(rider_id, {}).get("preferred_driver")`. The real version
+*queries* the rider's preference namespace:
+
+``` Python
+    # ── READ from memory: a semantic query against this rider's namespace ───
+    memories = memory_client.retrieve_memories(
+        memory_id=MEMORY_ID,
+        namespace=f"rideshare/{rider_id}/preferences",    # {actorId} filled in by us
+        query="Which driver does this rider prefer?",
+        top_k=3,
+    )
+    # memories is a list of extracted records; each has a text content field.
+    # Something like: [{"content": {"text": "Rider prefers driver Carlos Rivera (DRV-101)"}}, ...]
+
+    preferred_id = _extract_driver_id(memories, drivers)   # YOUR parsing — see below
+
+    if preferred_id and any(d["driver_id"] == preferred_id for d in drivers):
+        best = next(d for d in drivers if d["driver_id"] == preferred_id)
+        match_reason = "preferred driver (from memory)"
+    else:
+        best = max(drivers, key=lambda d: d["rating"])
+        match_reason = "highest rated available"
+```
+
+The `any(...)` availability guard from the demo survives unchanged — memory still only *informs* the
+choice, it doesn't override the pool. What changed is that the thing in memory is **prose**, not a
+driver ID. `_extract_driver_id` has to map "Rider prefers driver Carlos Rivera" back to `DRV-101` —
+by matching the name against `drivers`, or by having the write path embed the ID in the event text so
+it survives extraction verbatim. That parsing step does not exist in the dict version, and it is the
+honest cost of letting the service decide what to remember.
+
+> **Note:** the exact return shape of `retrieve_memories` and whether `namespace` or `namespace_path`
+> is the preferred argument name should be confirmed against the installed SDK version before relying
+> on it — the method surface has shifted across releases. The *pattern* (query a namespace, get back
+> extracted text records) is stable; the field names are the thing to check.
+
+### The part the lesson doesn't mention: extraction is slow and asynchronous
+
+This is the finding from the previous course that matters most here, observed against a live resource:
+**long-term extraction took 85–140 seconds after `create_event`, finished in no fixed order across
+strategies, and the set of extracted records varied between identical runs.**
+
+Trace what that does to the demo's three scenarios if the dict were real memory:
+
+```
+  TRIP-001 (Alice)   create_event → extraction starts in the background
+                                            │
+  TRIP-002 (Bob)     ... a few seconds ...  │  extraction still running (~1-2 min)
+                                            │
+  TRIP-003 (Alice)   retrieve_memories ─────┘  ← NOTHING THERE YET
+                     → falls to "highest rated available"
+                     → happens to pick Carlos anyway (he's top-rated)
+                     → match_reason says "highest rated", not "from memory"
+```
+
+Run back to back as the demo does, **Scenario 3 would not find Alice's preference**, because the
+preference hasn't been extracted yet. The dict is instant; the service is eventually consistent on a
+timescale of minutes. The demo only "works" with the dict because the dict has no extraction step.
+
+The design consequences are real:
+
+- **Cross-session memory is for the *next* session, not the next *minute*.** Alice's preference from
+  Monday is reliably available on Tuesday. It is not reliably available ninety seconds later. Any flow
+  that writes a preference and reads it back within the same request must not depend on long-term
+  memory for that read.
+- **Design the read path to tolerate absence.** The `else` branch (highest-rated fallback) isn't a
+  nice-to-have — it's the path that *will* run for every first-time rider and for every returning rider
+  whose extraction hasn't finished. Memory should improve a decision the code can already make
+  without it.
+- **Within-session facts belong in DynamoDB, not memory.** If the Pricing agent needs to know which
+  driver was just matched, it reads `trip.driver` from the transactional record — instant, consistent,
+  version-locked. That is the division the module states ("DynamoDB within-session, AgentCore Memory
+  cross-session"), and the extraction latency is *why* it's the right division, not just a convention.
+- **Don't test memory by writing and immediately reading.** The previous course's notebook had to poll
+  for over a minute to see records appear. A test that writes an event and asserts on
+  `retrieve_memories` in the same second will fail, and the failure will look like a bug in your code.
+
+### What stays the same, and what the dict was hiding
+
+| | Dict (`rider_memory`) | AgentCore Memory |
+|---|---|---|
+| Write | `rider_memory[rid]["preferred_driver"] = id` | `create_event(actor_id=rid, messages=[...])` |
+| What's stored | the fact you chose | the conversation; the service extracts the fact |
+| Read | `rider_memory.get(rid, {}).get("preferred_driver")` | `retrieve_memories(namespace=f".../{rid}/...", query="...")` |
+| Read returns | a driver ID, or `None` | prose records to parse, or `[]` |
+| Isolation per rider | the dict key | `actorId` → namespace |
+| Survives process restart | **no** | yes |
+| Available immediately after write | yes | **no — ~1–2 min extraction** |
+| Deterministic what's remembered | yes | **no — varies run to run** |
+| Cost | zero | per event stored, per record stored, per retrieval |
+
+The `any(...)` availability guard, the fallback to highest-rated, and the "memory informs but doesn't
+override" shape all carry over unchanged. What the dict was hiding is everything in the bottom four
+rows: that real memory persists, but arrives late, remembers approximately, and costs money. The demo
+showed the access pattern; this is the rest of it.
 
 ## The three scenarios
 
